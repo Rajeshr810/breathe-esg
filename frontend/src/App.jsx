@@ -1,7 +1,7 @@
 import { useState, useEffect, useCallback } from "react";
 import { CheckCircle, AlertTriangle, Clock, Lock, Upload, RefreshCw, ChevronDown, Filter, X, FileText, LogOut } from "lucide-react";
 
-const API = "/api";
+const API = `${import.meta.env.VITE_API_URL || "http://localhost:8000"}/api`;
 
 const SCOPE_COLORS = {
   scope_1: { bg: "bg-orange-100", text: "text-orange-800", label: "Scope 1", dot: "bg-orange-500" },
