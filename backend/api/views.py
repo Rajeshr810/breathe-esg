@@ -1,0 +1,321 @@
+"""
+API Views — Ingestion and Analyst Review Dashboard
+
+Endpoints:
+  POST /api/jobs/upload/           — Upload a file to start an ingestion job
+  GET  /api/jobs/                  — List all ingestion jobs for org
+  GET  /api/jobs/{id}/             — Job detail + row-level errors
+  GET  /api/records/               — List emissions records (filterable)
+  GET  /api/records/{id}/          — Record detail with audit trail
+  POST /api/records/{id}/approve/  — Approve a record
+  POST /api/records/{id}/flag/     — Flag a record with a note
+  POST /api/records/bulk_approve/  — Approve multiple records
+  POST /api/records/{id}/lock/     — Lock for audit
+  GET  /api/dashboard/summary/     — Dashboard aggregate stats
+"""
+
+import logging
+from django.db.models import Sum, Count, Q
+from django.utils import timezone
+from rest_framework import viewsets, status
+from rest_framework.decorators import action
+from rest_framework.permissions import IsAuthenticated
+from rest_framework.response import Response
+from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+
+from core.models import (
+    Organization, IngestionJob, EmissionsRecord, AuditLog, FacilityLocation
+)
+from .serializers import (
+    IngestionJobSerializer, EmissionsRecordSerializer,
+    EmissionsRecordListSerializer, AuditLogSerializer
+)
+from ingestion.tasks import process_ingestion_job
+
+logger = logging.getLogger(__name__)
+
+
+def get_user_org(request):
+    """Get the organization for the authenticated user."""
+    membership = request.user.memberships.select_related("organization").first()
+    if not membership:
+        return None
+    return membership.organization
+
+
+class IngestionJobViewSet(viewsets.ModelViewSet):
+    """
+    Manage ingestion jobs (file uploads → processed batches).
+    """
+    permission_classes = [IsAuthenticated]
+    parser_classes = [MultiPartParser, FormParser, JSONParser]
+    serializer_class = IngestionJobSerializer
+
+    def get_queryset(self):
+        org = get_user_org(self.request)
+        if not org:
+            return IngestionJob.objects.none()
+        return IngestionJob.objects.filter(organization=org).order_by("-created_at")
+
+    def create(self, request, *args, **kwargs):
+        """
+        Upload a file and kick off ingestion.
+        Expects: source_type (sap|utility|travel), file
+        """
+        return self._handle_upload(request)
+
+    @action(detail=False, methods=["post"], url_path="upload")
+    def upload(self, request):
+        """Alias: POST /api/jobs/upload/ — same as create."""
+        return self._handle_upload(request)
+
+    def _handle_upload(self, request):
+        org = get_user_org(request)
+        if not org:
+            return Response({"error": "No organization found for user"}, status=400)
+
+        source_type = request.data.get("source_type")
+        if source_type not in [c[0] for c in IngestionJob.SourceType.choices]:
+            return Response(
+                {"error": f"Invalid source_type. Must be one of: {[c[0] for c in IngestionJob.SourceType.choices]}"},
+                status=400
+            )
+
+        uploaded_file = request.FILES.get("file")
+        if not uploaded_file:
+            return Response({"error": "No file provided"}, status=400)
+
+        job = IngestionJob.objects.create(
+            organization=org,
+            source_type=source_type,
+            source_reference=uploaded_file.name,
+            raw_file=uploaded_file,
+            created_by=request.user,
+            status=IngestionJob.Status.PENDING,
+        )
+
+        # Process synchronously for prototype; in production: Celery task
+        try:
+            process_ingestion_job(job.id)
+        except Exception as e:
+            logger.error(f"Ingestion job {job.id} failed: {e}")
+            job.status = IngestionJob.Status.FAILED
+            job.error_log = [{"error": str(e)}]
+            job.save()
+
+        job.refresh_from_db()
+        return Response(IngestionJobSerializer(job).data, status=201)
+
+    @action(detail=True, methods=["get"])
+    def errors(self, request, pk=None):
+        """Return the full error log for a job."""
+        job = self.get_object()
+        return Response({
+            "job_id": str(job.id),
+            "status": job.status,
+            "rows_total": job.rows_total,
+            "rows_success": job.rows_success,
+            "rows_failed": job.rows_failed,
+            "rows_flagged": job.rows_flagged,
+            "error_log": job.error_log,
+        })
+
+
+class EmissionsRecordViewSet(viewsets.ModelViewSet):
+    """
+    View, filter, and review individual emissions records.
+    """
+    permission_classes = [IsAuthenticated]
+    serializer_class = EmissionsRecordSerializer
+    http_method_names = ["get", "post", "patch", "head", "options"]
+
+    def get_queryset(self):
+        org = get_user_org(self.request)
+        if not org:
+            return EmissionsRecord.objects.none()
+
+        qs = EmissionsRecord.objects.filter(
+            organization=org
+        ).select_related(
+            "job", "facility", "emission_factor", "reviewed_by"
+        ).order_by("-activity_date")
+
+        # Filtering
+        params = self.request.query_params
+        if status_filter := params.get("status"):
+            qs = qs.filter(status=status_filter)
+        if scope := params.get("scope"):
+            qs = qs.filter(scope=scope)
+        if source := params.get("source_type"):
+            qs = qs.filter(source_type=source)
+        if job_id := params.get("job"):
+            qs = qs.filter(job_id=job_id)
+        if flagged := params.get("flagged"):
+            if flagged.lower() == "true":
+                qs = qs.exclude(flags=[])
+        if date_from := params.get("date_from"):
+            qs = qs.filter(activity_date__gte=date_from)
+        if date_to := params.get("date_to"):
+            qs = qs.filter(activity_date__lte=date_to)
+
+        return qs
+
+    def get_serializer_class(self):
+        if self.action == "list":
+            return EmissionsRecordListSerializer
+        return EmissionsRecordSerializer
+
+    @action(detail=True, methods=["post"])
+    def approve(self, request, pk=None):
+        record = self.get_object()
+        if record.status == EmissionsRecord.Status.LOCKED:
+            return Response({"error": "Cannot approve a locked record"}, status=400)
+
+        note = request.data.get("note", "")
+        record.status = EmissionsRecord.Status.APPROVED
+        record.reviewed_by = request.user
+        record.reviewed_at = timezone.now()
+        record.reviewer_note = note
+        record.save()
+
+        AuditLog.objects.create(
+            record=record,
+            action=AuditLog.Action.APPROVED,
+            performed_by=request.user,
+            note=note,
+            snapshot={
+                "status": record.status,
+                "co2e_kg": str(record.co2e_kg),
+                "quantity_normalized": str(record.quantity_normalized),
+            }
+        )
+        return Response(EmissionsRecordSerializer(record).data)
+
+    @action(detail=True, methods=["post"])
+    def flag(self, request, pk=None):
+        record = self.get_object()
+        if record.status == EmissionsRecord.Status.LOCKED:
+            return Response({"error": "Cannot flag a locked record"}, status=400)
+
+        message = request.data.get("message", "Flagged by analyst")
+        record.status = EmissionsRecord.Status.FLAGGED
+        record.flags = record.flags + [{"code": "ANALYST_FLAG", "severity": "warning", "message": message}]
+        record.save()
+
+        AuditLog.objects.create(
+            record=record,
+            action=AuditLog.Action.FLAGGED,
+            performed_by=request.user,
+            note=message,
+        )
+        return Response(EmissionsRecordSerializer(record).data)
+
+    @action(detail=True, methods=["post"])
+    def lock(self, request, pk=None):
+        record = self.get_object()
+        try:
+            record.lock(request.user)
+        except ValueError as e:
+            return Response({"error": str(e)}, status=400)
+        return Response(EmissionsRecordSerializer(record).data)
+
+    @action(detail=False, methods=["post"])
+    def bulk_approve(self, request):
+        """Approve multiple records at once."""
+        ids = request.data.get("ids", [])
+        note = request.data.get("note", "Bulk approved")
+        org = get_user_org(request)
+
+        records = EmissionsRecord.objects.filter(
+            id__in=ids,
+            organization=org,
+        ).exclude(status=EmissionsRecord.Status.LOCKED)
+
+        updated = 0
+        for record in records:
+            record.status = EmissionsRecord.Status.APPROVED
+            record.reviewed_by = request.user
+            record.reviewed_at = timezone.now()
+            record.reviewer_note = note
+            updated += 1
+
+        EmissionsRecord.objects.bulk_update(
+            records, ["status", "reviewed_by", "reviewed_at", "reviewer_note"]
+        )
+
+        AuditLog.objects.bulk_create([
+            AuditLog(
+                record=r,
+                action=AuditLog.Action.APPROVED,
+                performed_by=request.user,
+                note=note,
+            ) for r in records
+        ])
+
+        return Response({"approved": updated})
+
+    @action(detail=True, methods=["get"])
+    def history(self, request, pk=None):
+        """Audit trail for a single record."""
+        record = self.get_object()
+        logs = AuditLog.objects.filter(record=record).order_by("timestamp")
+        return Response(AuditLogSerializer(logs, many=True).data)
+
+
+class DashboardViewSet(viewsets.ViewSet):
+    """
+    Aggregate statistics for the analyst dashboard.
+    """
+    permission_classes = [IsAuthenticated]
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        org = get_user_org(request)
+        if not org:
+            return Response({"error": "No organization"}, status=400)
+
+        records = EmissionsRecord.objects.filter(organization=org)
+
+        # Total CO2e by scope
+        scope_totals = records.filter(
+            status__in=[EmissionsRecord.Status.APPROVED, EmissionsRecord.Status.LOCKED]
+        ).values("scope").annotate(
+            total_co2e_kg=Sum("co2e_kg"),
+            count=Count("id")
+        )
+
+        # Review queue
+        pending_count = records.filter(status=EmissionsRecord.Status.PENDING).count()
+        flagged_count = records.filter(status=EmissionsRecord.Status.FLAGGED).count()
+        approved_count = records.filter(status=EmissionsRecord.Status.APPROVED).count()
+        locked_count = records.filter(status=EmissionsRecord.Status.LOCKED).count()
+
+        # Records with flags
+        with_flags = records.exclude(flags=[]).count()
+
+        # Recent jobs
+        recent_jobs = IngestionJob.objects.filter(
+            organization=org
+        ).order_by("-created_at")[:5].values(
+            "id", "source_type", "status", "rows_total",
+            "rows_success", "rows_failed", "rows_flagged", "created_at"
+        )
+
+        # Scope breakdown
+        scope_data = {item["scope"]: item for item in scope_totals}
+
+        return Response({
+            "totals": {
+                "scope_1_co2e_kg": scope_data.get("scope_1", {}).get("total_co2e_kg", 0),
+                "scope_2_co2e_kg": scope_data.get("scope_2", {}).get("total_co2e_kg", 0),
+                "scope_3_co2e_kg": scope_data.get("scope_3", {}).get("total_co2e_kg", 0),
+            },
+            "review_queue": {
+                "pending": pending_count,
+                "flagged": flagged_count,
+                "approved": approved_count,
+                "locked": locked_count,
+                "with_flags": with_flags,
+            },
+            "recent_jobs": list(recent_jobs),
+        })
