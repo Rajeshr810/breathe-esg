@@ -34,7 +34,7 @@ function fmtCO2(kg) {
 }
 
 async function apiFetch(path, opts = {}, token) {
-  const res = await fetch(`${API}${path}`, {
+  const res = await fetch(`${API}/auth/token/`, {
     headers: {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Token ${token}` } : {}),
