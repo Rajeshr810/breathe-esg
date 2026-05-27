@@ -47,7 +47,7 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "templates"],
+        "DIRS": [BASE_DIR / "staticfiles" / "frontend"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -100,6 +100,7 @@ USE_TZ = True
 # Static files
 STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_DIRS = [BASE_DIR / "staticfiles" / "frontend" / "assets"]
 STATICFILES_STORAGE = "whitenoise.storage.CompressedManifestStaticFilesStorage"
 
 # Media files (raw uploads)
@@ -146,7 +147,3 @@ LOGGING = {
         "django.db.backends": {"handlers": ["console"], "level": "WARNING"},
     },
 }
-
-# Serve built React frontend
-STATICFILES_DIRS = []
-TEMPLATES[0]["DIRS"] = []
