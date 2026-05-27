@@ -1,8 +1,7 @@
 from django.contrib import admin
-from django.urls import path, include, re_path
+from django.urls import path, include
 from django.conf import settings
 from django.conf.urls.static import static
-from django.views.generic import TemplateView
 from rest_framework.authtoken.views import obtain_auth_token
 from rest_framework.routers import DefaultRouter
 
@@ -17,8 +16,8 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("api/auth/token/", obtain_auth_token, name="api-token"),
     path("api/", include(router.urls)),
-    # Serve React frontend for all non-API routes
-    re_path(r"^(?!api/|admin/|media/).*$",
-            TemplateView.as_view(template_name="index.html"),
-            name="frontend"),
+    # React frontend will be connected later
+    # re_path(r"^(?!api/|admin/|media/).*$",
+    #         TemplateView.as_view(template_name="index.html"),
+    #         name="frontend"),
 ] + static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
