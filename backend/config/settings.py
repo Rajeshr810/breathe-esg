@@ -7,12 +7,11 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-only-insecure-key-change-in-production")
 DEBUG = os.environ.get("DEBUG", "False").lower() == "true"
 
-ALLOWED_HOSTS = os.environ.get(
-    "ALLOWED_HOSTS", "localhost,127.0.0.1"
-).split(",")
+ALLOWED_HOSTS = ["*"]
 
 CSRF_TRUSTED_ORIGINS = os.environ.get(
-    "CSRF_TRUSTED_ORIGINS", "http://localhost:3000,http://localhost:8000"
+    "CSRF_TRUSTED_ORIGINS",
+    "http://localhost:3000,http://localhost:8000"
 ).split(",")
 
 INSTALLED_APPS = [
@@ -47,7 +46,7 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [BASE_DIR / "staticfiles" / "frontend"],
+        "DIRS": [],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -62,7 +61,8 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-# Database
+# Database — use SQLite if no DATABASE_URL set
+# This means it works on Render free tier without PostgreSQL issues
 DATABASE_URL = os.environ.get("DATABASE_URL")
 if DATABASE_URL:
     parsed = urlparse(DATABASE_URL)
@@ -77,6 +77,7 @@ if DATABASE_URL:
         }
     }
 else:
+    # SQLite — works everywhere, no extra dependencies
     DATABASES = {
         "default": {
             "ENGINE": "django.db.backends.sqlite3",
