@@ -1,27 +1,17 @@
 """
 API Views — Ingestion and Analyst Review Dashboard
-
-Endpoints:
-  POST /api/jobs/upload/           — Upload a file to start an ingestion job
-  GET  /api/jobs/                  — List all ingestion jobs for org
-  GET  /api/jobs/{id}/             — Job detail + row-level errors
-  GET  /api/records/               — List emissions records (filterable)
-  GET  /api/records/{id}/          — Record detail with audit trail
-  POST /api/records/{id}/approve/  — Approve a record
-  POST /api/records/{id}/flag/     — Flag a record with a note
-  POST /api/records/bulk_approve/  — Approve multiple records
-  POST /api/records/{id}/lock/     — Lock for audit
-  GET  /api/dashboard/summary/     — Dashboard aggregate stats
 """
 
 import logging
 from django.db.models import Sum, Count, Q
 from django.utils import timezone
+from django.contrib.auth import authenticate
 from rest_framework import viewsets, status
-from rest_framework.decorators import action
-from rest_framework.permissions import IsAuthenticated
+from rest_framework.decorators import action, api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework.parsers import MultiPartParser, FormParser, JSONParser
+from rest_framework.authtoken.models import Token
 
 from core.models import (
     Organization, IngestionJob, EmissionsRecord, AuditLog, FacilityLocation
@@ -35,6 +25,18 @@ from ingestion.tasks import process_ingestion_job
 logger = logging.getLogger(__name__)
 
 
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def login_view(request):
+    username = request.data.get('username')
+    password = request.data.get('password')
+    user = authenticate(username=username, password=password)
+    if not user:
+        return Response({'error': 'Invalid credentials'}, status=status.HTTP_400_BAD_REQUEST)
+    token, _ = Token.objects.get_or_create(user=user)
+    return Response({'token': token.key})
+
+
 def get_user_org(request):
     """Get the organization for the authenticated user."""
     membership = request.user.memberships.select_related("organization").first()
@@ -44,9 +46,6 @@ def get_user_org(request):
 
 
 class IngestionJobViewSet(viewsets.ModelViewSet):
-    """
-    Manage ingestion jobs (file uploads → processed batches).
-    """
     permission_classes = [IsAuthenticated]
     parser_classes = [MultiPartParser, FormParser, JSONParser]
     serializer_class = IngestionJobSerializer
@@ -58,15 +57,10 @@ class IngestionJobViewSet(viewsets.ModelViewSet):
         return IngestionJob.objects.filter(organization=org).order_by("-created_at")
 
     def create(self, request, *args, **kwargs):
-        """
-        Upload a file and kick off ingestion.
-        Expects: source_type (sap|utility|travel), file
-        """
         return self._handle_upload(request)
 
     @action(detail=False, methods=["post"], url_path="upload")
     def upload(self, request):
-        """Alias: POST /api/jobs/upload/ — same as create."""
         return self._handle_upload(request)
 
     def _handle_upload(self, request):
@@ -94,7 +88,6 @@ class IngestionJobViewSet(viewsets.ModelViewSet):
             status=IngestionJob.Status.PENDING,
         )
 
-        # Process synchronously for prototype; in production: Celery task
         try:
             process_ingestion_job(job.id)
         except Exception as e:
@@ -108,7 +101,6 @@ class IngestionJobViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"])
     def errors(self, request, pk=None):
-        """Return the full error log for a job."""
         job = self.get_object()
         return Response({
             "job_id": str(job.id),
@@ -122,9 +114,6 @@ class IngestionJobViewSet(viewsets.ModelViewSet):
 
 
 class EmissionsRecordViewSet(viewsets.ModelViewSet):
-    """
-    View, filter, and review individual emissions records.
-    """
     permission_classes = [IsAuthenticated]
     serializer_class = EmissionsRecordSerializer
     http_method_names = ["get", "post", "patch", "head", "options"]
@@ -140,7 +129,6 @@ class EmissionsRecordViewSet(viewsets.ModelViewSet):
             "job", "facility", "emission_factor", "reviewed_by"
         ).order_by("-activity_date")
 
-        # Filtering
         params = self.request.query_params
         if status_filter := params.get("status"):
             qs = qs.filter(status=status_filter)
@@ -170,14 +158,12 @@ class EmissionsRecordViewSet(viewsets.ModelViewSet):
         record = self.get_object()
         if record.status == EmissionsRecord.Status.LOCKED:
             return Response({"error": "Cannot approve a locked record"}, status=400)
-
         note = request.data.get("note", "")
         record.status = EmissionsRecord.Status.APPROVED
         record.reviewed_by = request.user
         record.reviewed_at = timezone.now()
         record.reviewer_note = note
         record.save()
-
         AuditLog.objects.create(
             record=record,
             action=AuditLog.Action.APPROVED,
@@ -196,12 +182,10 @@ class EmissionsRecordViewSet(viewsets.ModelViewSet):
         record = self.get_object()
         if record.status == EmissionsRecord.Status.LOCKED:
             return Response({"error": "Cannot flag a locked record"}, status=400)
-
         message = request.data.get("message", "Flagged by analyst")
         record.status = EmissionsRecord.Status.FLAGGED
         record.flags = record.flags + [{"code": "ANALYST_FLAG", "severity": "warning", "message": message}]
         record.save()
-
         AuditLog.objects.create(
             record=record,
             action=AuditLog.Action.FLAGGED,
@@ -221,16 +205,13 @@ class EmissionsRecordViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["post"])
     def bulk_approve(self, request):
-        """Approve multiple records at once."""
         ids = request.data.get("ids", [])
         note = request.data.get("note", "Bulk approved")
         org = get_user_org(request)
-
         records = EmissionsRecord.objects.filter(
             id__in=ids,
             organization=org,
         ).exclude(status=EmissionsRecord.Status.LOCKED)
-
         updated = 0
         for record in records:
             record.status = EmissionsRecord.Status.APPROVED
@@ -238,11 +219,9 @@ class EmissionsRecordViewSet(viewsets.ModelViewSet):
             record.reviewed_at = timezone.now()
             record.reviewer_note = note
             updated += 1
-
         EmissionsRecord.objects.bulk_update(
             records, ["status", "reviewed_by", "reviewed_at", "reviewer_note"]
         )
-
         AuditLog.objects.bulk_create([
             AuditLog(
                 record=r,
@@ -251,21 +230,16 @@ class EmissionsRecordViewSet(viewsets.ModelViewSet):
                 note=note,
             ) for r in records
         ])
-
         return Response({"approved": updated})
 
     @action(detail=True, methods=["get"])
     def history(self, request, pk=None):
-        """Audit trail for a single record."""
         record = self.get_object()
         logs = AuditLog.objects.filter(record=record).order_by("timestamp")
         return Response(AuditLogSerializer(logs, many=True).data)
 
 
 class DashboardViewSet(viewsets.ViewSet):
-    """
-    Aggregate statistics for the analyst dashboard.
-    """
     permission_classes = [IsAuthenticated]
 
     @action(detail=False, methods=["get"])
@@ -276,7 +250,6 @@ class DashboardViewSet(viewsets.ViewSet):
 
         records = EmissionsRecord.objects.filter(organization=org)
 
-        # Total CO2e by scope
         scope_totals = records.filter(
             status__in=[EmissionsRecord.Status.APPROVED, EmissionsRecord.Status.LOCKED]
         ).values("scope").annotate(
@@ -284,16 +257,12 @@ class DashboardViewSet(viewsets.ViewSet):
             count=Count("id")
         )
 
-        # Review queue
         pending_count = records.filter(status=EmissionsRecord.Status.PENDING).count()
         flagged_count = records.filter(status=EmissionsRecord.Status.FLAGGED).count()
         approved_count = records.filter(status=EmissionsRecord.Status.APPROVED).count()
         locked_count = records.filter(status=EmissionsRecord.Status.LOCKED).count()
-
-        # Records with flags
         with_flags = records.exclude(flags=[]).count()
 
-        # Recent jobs
         recent_jobs = IngestionJob.objects.filter(
             organization=org
         ).order_by("-created_at")[:5].values(
@@ -301,7 +270,6 @@ class DashboardViewSet(viewsets.ViewSet):
             "rows_success", "rows_failed", "rows_flagged", "created_at"
         )
 
-        # Scope breakdown
         scope_data = {item["scope"]: item for item in scope_totals}
 
         return Response({
