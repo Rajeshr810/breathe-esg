@@ -33,8 +33,9 @@ function fmtCO2(kg) {
   return t >= 1 ? `${t.toFixed(2)} tCO₂e` : `${parseFloat(kg).toFixed(1)} kgCO₂e`;
 }
 
+// ── FIXED apiFetch — was hardcoded to /auth/token/ ──
 async function apiFetch(path, opts = {}, token) {
-  const res = await fetch(`${API}/auth/token/`, {
+  const res = await fetch(`${API}${path}`, {
     headers: {
       "Content-Type": "application/json",
       ...(token ? { Authorization: `Token ${token}` } : {}),
@@ -49,7 +50,6 @@ async function apiFetch(path, opts = {}, token) {
   return res.json();
 }
 
-// ── Login Screen ─────────────────────────────────────────────────────────────
 function LoginScreen({ onLogin }) {
   const [username, setUsername] = useState("analyst");
   const [password, setPassword] = useState("breathe-analyst-2024");
@@ -66,7 +66,7 @@ function LoginScreen({ onLogin }) {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ username, password }),
       });
-      if (!res.ok) throw new Error("Invalid credentials");
+      if (!res.ok) throw new Error("Invalid credentials — check backend is running");
       const data = await res.json();
       onLogin(data.token);
     } catch (e) {
@@ -131,6 +131,7 @@ function ScopeBar({ scope1, scope2, scope3 }) {
     </div>
   );
 }
+
 function StatusBadge({ status }) {
   const cfg = STATUS_CONFIG[status] || STATUS_CONFIG.pending;
   const Icon = cfg.icon;
@@ -140,6 +141,7 @@ function StatusBadge({ status }) {
     </span>
   );
 }
+
 function ScopeBadge({ scope }) {
   const cfg = SCOPE_COLORS[scope];
   if (!cfg) return null;
@@ -311,40 +313,65 @@ export default function App() {
 
   const loadSummary = useCallback(async () => {
     if (!token) return;
-    try { setSummary(await apiFetch("/dashboard/summary/", {}, token)); }
-    catch(e) { if (e.message.startsWith("401")) setToken(""); }
+    try {
+      const data = await apiFetch("/dashboard/summary/", {}, token);
+      setSummary(data);
+    } catch(e) {
+      if (e.message.startsWith("401")) { localStorage.removeItem("esg_token"); setToken(""); }
+      console.error("Summary error:", e.message);
+    }
   }, [token]);
 
   const loadRecords = useCallback(async () => {
     if (!token) return;
     setLoading(true);
     try {
-      const params = new URLSearchParams({ page, page_size:25, ...Object.fromEntries(Object.entries(filters).filter(([,v])=>v)) });
+      const params = new URLSearchParams({
+        page,
+        page_size: 25,
+        ...Object.fromEntries(Object.entries(filters).filter(([,v])=>v))
+      });
       const data = await apiFetch(`/records/?${params}`, {}, token);
       setRecords(data.results || data);
       setTotalCount(data.count || (data.results||data).length);
-    } catch(e) { console.error(e); }
-    finally { setLoading(false); }
+    } catch(e) {
+      console.error("Records error:", e.message);
+    } finally {
+      setLoading(false);
+    }
   }, [token, filters, page]);
 
   useEffect(() => { loadSummary(); loadRecords(); }, [loadSummary, loadRecords]);
 
   async function handleApprove(id) {
-    await apiFetch(`/records/${id}/approve/`, {method:"POST",body:JSON.stringify({})}, token);
-    loadRecords(); loadSummary();
+    try {
+      await apiFetch(`/records/${id}/approve/`, { method:"POST", body:JSON.stringify({}) }, token);
+      loadRecords(); loadSummary();
+    } catch(e) { alert("Approve failed: " + e.message); }
   }
+
   async function handleFlag(id) {
     const msg = prompt("Reason (optional):") || "Flagged by analyst";
-    await apiFetch(`/records/${id}/flag/`, {method:"POST",body:JSON.stringify({message:msg})}, token);
-    loadRecords();
+    try {
+      await apiFetch(`/records/${id}/flag/`, { method:"POST", body:JSON.stringify({message:msg}) }, token);
+      loadRecords();
+    } catch(e) { alert("Flag failed: " + e.message); }
   }
+
   async function handleBulkApprove() {
     if (!selected.size) return;
-    await apiFetch("/records/bulk_approve/", {method:"POST",body:JSON.stringify({ids:[...selected]})}, token);
-    setSelected(new Set()); loadRecords(); loadSummary();
+    try {
+      await apiFetch("/records/bulk_approve/", { method:"POST", body:JSON.stringify({ids:[...selected]}) }, token);
+      setSelected(new Set()); loadRecords(); loadSummary();
+    } catch(e) { alert("Bulk approve failed: " + e.message); }
   }
-  function toggleSelect(id) { setSelected(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; }); }
-  function toggleSelectAll() { setSelected(prev=>prev.size===records.length?new Set():new Set(records.map(r=>r.id))); }
+
+  function toggleSelect(id) {
+    setSelected(prev=>{ const n=new Set(prev); n.has(id)?n.delete(id):n.add(id); return n; });
+  }
+  function toggleSelectAll() {
+    setSelected(prev => prev.size===records.length ? new Set() : new Set(records.map(r=>r.id)));
+  }
 
   if (!token) return <LoginScreen onLogin={handleLogin}/>;
 
